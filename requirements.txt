@@ -1,5 +1,5 @@
-pandas
-ta
+streamlit
 requests
-schedule
-python-telegram-bot==20.3
+websocket-client
+pandas
+pandas_ta
