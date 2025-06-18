@@ -1,5 +1,5 @@
 streamlit
-requests
 websocket-client
+requests
 pandas
 numpy
