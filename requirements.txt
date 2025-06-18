@@ -3,5 +3,6 @@ requests
 websocket-client
 pandas
 pandas_ta
+numpy
 setuptools
 wheel
