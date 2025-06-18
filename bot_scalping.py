@@ -6,21 +6,21 @@ import pandas as pd
 import requests
 import numpy as np
 
-# ===== KONFIGURASI =====
+# ===== KONFIGURASI BOT TELEGRAM =====
 BOT_TOKEN = "8125493408:AAGnuSkf_BwscznH9B_gjzSTNOrVgSd0jos"
 CHAT_ID = "5622746102"
 SYMBOL = "frxXAUUSD"
-DURATION = 60  # 1 menit
+DURATION = 60  # timeframe 1 menit
 CANDLE_LIMIT = 100
 
 candles = []
 
-# ===== TELEGRAM FUNCTION =====
+# ===== FUNGSI TELEGRAM =====
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": text})
 
-# ===== INDIKATOR MANUAL =====
+# ===== PERHITUNGAN INDIKATOR MANUAL =====
 def calculate_indicators(df):
     df['ema50'] = df['close'].ewm(span=50).mean()
     df['bb_middle'] = df['close'].rolling(window=20).mean()
@@ -30,7 +30,6 @@ def calculate_indicators(df):
     df['sar'] = calculate_parabolic_sar(df)
     return df
 
-# ===== PARABOLIC SAR MANUAL =====
 def calculate_parabolic_sar(df, af=0.02, max_af=0.2):
     length = len(df)
     sar = [df['low'][0]]
@@ -65,7 +64,7 @@ def calculate_parabolic_sar(df, af=0.02, max_af=0.2):
         sar.append(curr_sar)
     return sar
 
-# ===== CEK SIGNAL =====
+# ===== CEK SINYAL =====
 def check_signal(df):
     latest = df.iloc[-1]
     confidence = 0
@@ -95,13 +94,18 @@ def check_signal(df):
         confidence += 1
         reasons.append("SAR above price")
 
-    if confidence >= 3:
+    # Kirim sinyal atau info
+    if confidence >= 2:
         direction = "BUY" if latest['close'] > latest['ema50'] else "SELL"
         msg = f"📊 Signal: {direction} on XAUUSD (1M)\nConfidence: {confidence}/3 ({int((confidence/3)*100)}%)\nReason:\n- " + "\n- ".join(reasons)
         send_telegram_message(msg)
         st.success(msg)
+    else:
+        msg = f"❌ Tidak ada sinyal valid untuk XAUUSD (1M)\nConfidence: {confidence}/3"
+        send_telegram_message(msg)
+        st.warning(msg)
 
-# ===== PROSES CANDLE MASUK =====
+# ===== PROSES CANDLE =====
 def process_candle(data):
     global candles
     ohlc = data['ohlc']
@@ -119,7 +123,7 @@ def process_candle(data):
         df = calculate_indicators(df)
         check_signal(df)
 
-# ===== WEBSOCKET CALLBACK =====
+# ===== CALLBACK WEBSOCKET =====
 def on_message(ws, message):
     data = json.loads(message)
     if data['msg_type'] == 'ohlc':
@@ -142,7 +146,7 @@ def on_error(ws, error):
 def on_close(ws, close_status_code, close_msg):
     st.warning("WebSocket closed")
 
-# ===== JALANKAN BOT =====
+# ===== JALANKAN BOT WEBSOCKET =====
 def run_bot():
     send_telegram_message("✅ Bot sinyal XAUUSD aktif di Streamlit Cloud.")
     websocket.enableTrace(False)
@@ -164,4 +168,4 @@ if st.button("🚀 Jalankan Bot"):
     thread = threading.Thread(target=run_bot)
     thread.daemon = True
     thread.start()
-    st.success("✅ Bot sedang berjalan... Sinyal akan dikirim ke Telegram jika ada kombinasi sinyal valid.")
+    st.success("✅ Bot sedang berjalan... sinyal dikirim via Telegram tiap candle.")
