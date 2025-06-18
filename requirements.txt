@@ -3,6 +3,3 @@ requests
 websocket-client
 pandas
 numpy
-git+https://github.com/twopirllc/pandas-ta
-setuptools
-wheel
