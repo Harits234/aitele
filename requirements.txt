@@ -3,3 +3,5 @@ requests
 websocket-client
 pandas
 pandas_ta
+setuptools
+wheel
