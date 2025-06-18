@@ -3,65 +3,103 @@ import websocket
 import json
 import threading
 import pandas as pd
-import pandas_ta as ta
 import requests
+import numpy as np
 
-# ===== SETUP TELEGRAM =====
+# ===== KONFIGURASI =====
 BOT_TOKEN = "8125493408:AAGnuSkf_BwscznH9B_gjzSTNOrVgSd0jos"
 CHAT_ID = "5622746102"
-
-# ===== SETUP PAIR DAN CANDLE =====
-SYMBOL = "frxXAUUSD"  # bisa diganti frxEURUSD, frxGBPUSD
+SYMBOL = "frxXAUUSD"
 DURATION = 60  # 1 menit
-CANDLE_LIMIT = 55
+CANDLE_LIMIT = 100
 
-# ===== STATE CANDLE =====
 candles = []
 
-# ===== KIRIM PESAN TELEGRAM =====
+# ===== TELEGRAM FUNCTION =====
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": text})
 
-# ===== CEK SINYAL DARI KOMBINASI 3 INDIKATOR =====
+# ===== INDIKATOR MANUAL =====
+def calculate_indicators(df):
+    df['ema50'] = df['close'].ewm(span=50).mean()
+    df['bb_middle'] = df['close'].rolling(window=20).mean()
+    df['bb_std'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['bb_middle'] + 2 * df['bb_std']
+    df['bb_lower'] = df['bb_middle'] - 2 * df['bb_std']
+    df['sar'] = calculate_parabolic_sar(df)
+    return df
+
+# ===== PARABOLIC SAR MANUAL =====
+def calculate_parabolic_sar(df, af=0.02, max_af=0.2):
+    length = len(df)
+    sar = [df['low'][0]]
+    ep = df['high'][0]
+    trend = 1
+    af_val = af
+
+    for i in range(1, length):
+        prev_sar = sar[-1]
+        if trend == 1:
+            curr_sar = prev_sar + af_val * (ep - prev_sar)
+            if df['low'][i] < curr_sar:
+                trend = -1
+                curr_sar = ep
+                ep = df['low'][i]
+                af_val = af
+            else:
+                if df['high'][i] > ep:
+                    ep = df['high'][i]
+                    af_val = min(af_val + af, max_af)
+        else:
+            curr_sar = prev_sar + af_val * (ep - prev_sar)
+            if df['high'][i] > curr_sar:
+                trend = 1
+                curr_sar = ep
+                ep = df['high'][i]
+                af_val = af
+            else:
+                if df['low'][i] < ep:
+                    ep = df['low'][i]
+                    af_val = min(af_val + af, max_af)
+        sar.append(curr_sar)
+    return sar
+
+# ===== CEK SIGNAL =====
 def check_signal(df):
     latest = df.iloc[-1]
-    valid = {
-        "bb": False,
-        "sar": False,
-        "ema": False
-    }
+    confidence = 0
+    reasons = []
 
-    # Cek BB
-    if latest['close'] < latest['BBL_20_2.0']:
-        valid["bb"] = "buy"
-    elif latest['close'] > latest['BBU_20_2.0']:
-        valid["bb"] = "sell"
+    # Bollinger Band
+    if latest['close'] < latest['bb_lower']:
+        confidence += 1
+        reasons.append("Close < Lower BB")
+    elif latest['close'] > latest['bb_upper']:
+        confidence += 1
+        reasons.append("Close > Upper BB")
 
-    # Cek SAR
-    if latest['sar'] < latest['close']:
-        valid["sar"] = "buy"
-    elif latest['sar'] > latest['close']:
-        valid["sar"] = "sell"
-
-    # Cek EMA
+    # EMA
     if latest['close'] > latest['ema50']:
-        valid["ema"] = "buy"
+        confidence += 1
+        reasons.append("Close > EMA50")
     elif latest['close'] < latest['ema50']:
-        valid["ema"] = "sell"
+        confidence += 1
+        reasons.append("Close < EMA50")
 
-    all_values = list(valid.values())
-    buy_count = all_values.count("buy")
-    sell_count = all_values.count("sell")
+    # SAR
+    if latest['close'] > latest['sar']:
+        confidence += 1
+        reasons.append("SAR below price")
+    elif latest['close'] < latest['sar']:
+        confidence += 1
+        reasons.append("SAR above price")
 
-    if buy_count >= 2:
-        confidence = int((buy_count / 3) * 100)
-        return f"📈 BUY Signal on XAUUSD (1M)\nConfidence: {confidence}%"
-    elif sell_count >= 2:
-        confidence = int((sell_count / 3) * 100)
-        return f"📉 SELL Signal on XAUUSD (1M)\nConfidence: {confidence}%"
-
-    return None
+    if confidence >= 3:
+        direction = "BUY" if latest['close'] > latest['ema50'] else "SELL"
+        msg = f"📊 Signal: {direction} on XAUUSD (1M)\nConfidence: {confidence}/3 ({int((confidence/3)*100)}%)\nReason:\n- " + "\n- ".join(reasons)
+        send_telegram_message(msg)
+        st.success(msg)
 
 # ===== PROSES CANDLE MASUK =====
 def process_candle(data):
@@ -77,30 +115,18 @@ def process_candle(data):
         candles = candles[-CANDLE_LIMIT:]
 
     df = pd.DataFrame(candles, columns=['open', 'high', 'low', 'close'])
-    df['ema50'] = ta.ema(df['close'], length=50)
-    bb = ta.bbands(df['close'], length=20)
-    df = df.join(bb)
-    df['sar'] = ta.sar(df['high'], df['low'])
+    if len(df) >= 55:
+        df = calculate_indicators(df)
+        check_signal(df)
 
-    signal = check_signal(df)
-    if signal:
-        send_telegram_message(signal)
-        st.success(signal)
-
-# ===== CALLBACK WEBSOCKET =====
+# ===== WEBSOCKET CALLBACK =====
 def on_message(ws, message):
     data = json.loads(message)
     if data['msg_type'] == 'ohlc':
         process_candle(data)
 
-def on_error(ws, error):
-    st.error(f"WebSocket Error: {error}")
-
-def on_close(ws, close_status_code, close_msg):
-    st.warning("WebSocket closed")
-
 def on_open(ws):
-    sub_msg = {
+    msg = {
         "ticks_history": SYMBOL,
         "adjust_start_time": 1,
         "count": 1,
@@ -108,11 +134,17 @@ def on_open(ws):
         "style": "candles",
         "subscribe": 1
     }
-    ws.send(json.dumps(sub_msg))
+    ws.send(json.dumps(msg))
+
+def on_error(ws, error):
+    st.error(f"WebSocket error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    st.warning("WebSocket closed")
 
 # ===== JALANKAN BOT =====
 def run_bot():
-    send_telegram_message("✅ Bot sinyal XAUUSD telah AKTIF dan siap mengirim sinyal...")
+    send_telegram_message("✅ Bot sinyal XAUUSD aktif di Streamlit Cloud.")
     websocket.enableTrace(False)
     ws = websocket.WebSocketApp(
         "wss://ws.binaryws.com/websockets/v3?app_id=1089",
@@ -123,14 +155,13 @@ def run_bot():
     )
     ws.run_forever()
 
-# ===== STREAMLIT UI =====
-st.title("📡 Bot Sinyal Trading XAUUSD - Real-time Deriv")
-st.markdown("Indikator: **EMA50 + Bollinger Bands + Parabolic SAR**")
-st.markdown("---")
+# ===== UI STREAMLIT =====
+st.set_page_config(page_title="Bot Sinyal Trading", layout="centered")
+st.title("🤖 Bot Sinyal Trading XAUUSD (Deriv WebSocket)")
+st.caption("Real-time | EMA50 + BB + SAR | TF: 1M")
 
-if st.button("🚀 Jalankan Bot Sekarang"):
-    t = threading.Thread(target=run_bot)
-    t.daemon = True
-    t.start()
-    st.success("✅ Bot aktif. Tunggu sinyal dikirim ke Telegram.")
-    st.info("Bot akan mengirim sinyal hanya jika minimal 2 dari 3 indikator cocok (Buy/Sell).")
+if st.button("🚀 Jalankan Bot"):
+    thread = threading.Thread(target=run_bot)
+    thread.daemon = True
+    thread.start()
+    st.success("✅ Bot sedang berjalan... Sinyal akan dikirim ke Telegram jika ada kombinasi sinyal valid.")
