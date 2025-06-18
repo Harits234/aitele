@@ -1,109 +1,136 @@
-import logging, asyncio
-import requests
+import streamlit as st
+import websocket
+import json
+import threading
 import pandas as pd
-import ta
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler,
-    MessageHandler, filters, ContextTypes,
-    ConversationHandler
-)
+import pandas_ta as ta
+import requests
 
-TOKEN = "8125493408:AAGnuSkf_BwscznH9B_gjzSTNOrVgSd0jos"
-PAIR_LIST = ["XAUUSD", "USDJPY", "EURUSD", "BTCUSD"]
-SELECTING_PAIR = 1
-user_pairs = {}
+# ===== SETUP TELEGRAM =====
+BOT_TOKEN = "8125493408:AAGnuSkf_BwscznH9B_gjzSTNOrVgSd0jos"
+CHAT_ID = "5622746102"
 
-# Logging
-logging.basicConfig(level=logging.INFO)
+# ===== SETUP PAIR DAN CANDLE =====
+SYMBOL = "frxXAUUSD"  # bisa diganti frxEURUSD, frxGBPUSD
+DURATION = 60  # 1 menit
+CANDLE_LIMIT = 55
 
-# Format pair Deriv
-def format_symbol(symbol):
-    return symbol.replace("USD", "").upper() + "USD"
+# ===== STATE CANDLE =====
+candles = []
 
-# Ambil data harga dari Deriv
-def get_data(symbol):
-    symbol = format_symbol(symbol)
-    url = f"https://api.deriv.com/api/v1/ohlc/ticks?instrument={symbol}&granularity=300&count=100"
-    res = requests.get(url)
-    try:
-        data = res.json()
-        candles = data["ohlc"]
-        df = pd.DataFrame(candles)
-        df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"}, inplace=True)
-        df["Close"] = pd.to_numeric(df["Close"])
-        df["High"] = pd.to_numeric(df["High"])
-        df["Low"] = pd.to_numeric(df["Low"])
-        df["Open"] = pd.to_numeric(df["Open"])
-        return df
-    except Exception as e:
-        logging.error(f"Gagal ambil data Deriv: {e}")
-        return None
+# ===== KIRIM PESAN TELEGRAM =====
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": text})
 
-# Logika sinyal trading
-def get_signal(symbol):
-    df = get_data(symbol)
-    if df is None or df.empty:
-        return None
-
-    # Indikator teknikal
-    df['ema50'] = ta.trend.ema_indicator(df['Close'], window=50)
-    bb = ta.volatility.BollingerBands(df['Close'], window=20)
-    df['bb_upper'] = bb.bollinger_hband()
-    df['bb_lower'] = bb.bollinger_lband()
-    df['sar'] = ta.trend.psar_up(df['High'], df['Low'], df['Close'])
-
+# ===== CEK SINYAL DARI KOMBINASI 3 INDIKATOR =====
+def check_signal(df):
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
+    valid = {
+        "bb": False,
+        "sar": False,
+        "ema": False
+    }
 
-    signal = None
-    if latest['Close'] > latest['ema50'] and latest['Close'] < latest['bb_lower'] and latest['Close'] > latest['sar']:
-        signal = f"🔔 BUY Signal pada {symbol}\nHarga: {latest['Close']:.2f}"
-    elif latest['Close'] < latest['ema50'] and latest['Close'] > latest['bb_upper'] and latest['Close'] < latest['sar']:
-        signal = f"🔔 SELL Signal pada {symbol}\nHarga: {latest['Close']:.2f}"
-    return signal
+    # Cek BB
+    if latest['close'] < latest['BBL_20_2.0']:
+        valid["bb"] = "buy"
+    elif latest['close'] > latest['BBU_20_2.0']:
+        valid["bb"] = "sell"
 
-# Bot Command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply_keyboard = [[pair] for pair in PAIR_LIST]
-    await update.message.reply_text(
-        "👋 Hai! Pilih pair untuk menerima sinyal scalping:",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+    # Cek SAR
+    if latest['sar'] < latest['close']:
+        valid["sar"] = "buy"
+    elif latest['sar'] > latest['close']:
+        valid["sar"] = "sell"
+
+    # Cek EMA
+    if latest['close'] > latest['ema50']:
+        valid["ema"] = "buy"
+    elif latest['close'] < latest['ema50']:
+        valid["ema"] = "sell"
+
+    all_values = list(valid.values())
+    buy_count = all_values.count("buy")
+    sell_count = all_values.count("sell")
+
+    if buy_count >= 2:
+        confidence = int((buy_count / 3) * 100)
+        return f"📈 BUY Signal on XAUUSD (1M)\nConfidence: {confidence}%"
+    elif sell_count >= 2:
+        confidence = int((sell_count / 3) * 100)
+        return f"📉 SELL Signal on XAUUSD (1M)\nConfidence: {confidence}%"
+
+    return None
+
+# ===== PROSES CANDLE MASUK =====
+def process_candle(data):
+    global candles
+    ohlc = data['ohlc']
+    candles.append([
+        float(ohlc['open']),
+        float(ohlc['high']),
+        float(ohlc['low']),
+        float(ohlc['close'])
+    ])
+    if len(candles) > CANDLE_LIMIT:
+        candles = candles[-CANDLE_LIMIT:]
+
+    df = pd.DataFrame(candles, columns=['open', 'high', 'low', 'close'])
+    df['ema50'] = ta.ema(df['close'], length=50)
+    bb = ta.bbands(df['close'], length=20)
+    df = df.join(bb)
+    df['sar'] = ta.sar(df['high'], df['low'])
+
+    signal = check_signal(df)
+    if signal:
+        send_telegram_message(signal)
+        st.success(signal)
+
+# ===== CALLBACK WEBSOCKET =====
+def on_message(ws, message):
+    data = json.loads(message)
+    if data['msg_type'] == 'ohlc':
+        process_candle(data)
+
+def on_error(ws, error):
+    st.error(f"WebSocket Error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    st.warning("WebSocket closed")
+
+def on_open(ws):
+    sub_msg = {
+        "ticks_history": SYMBOL,
+        "adjust_start_time": 1,
+        "count": 1,
+        "granularity": DURATION,
+        "style": "candles",
+        "subscribe": 1
+    }
+    ws.send(json.dumps(sub_msg))
+
+# ===== JALANKAN BOT =====
+def run_bot():
+    send_telegram_message("✅ Bot sinyal XAUUSD telah AKTIF dan siap mengirim sinyal...")
+    websocket.enableTrace(False)
+    ws = websocket.WebSocketApp(
+        "wss://ws.binaryws.com/websockets/v3?app_id=1089",
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
     )
-    return SELECTING_PAIR
+    ws.run_forever()
 
-async def select_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    pair = update.message.text.upper()
-    if pair in PAIR_LIST:
-        user_pairs[chat_id] = pair
-        await update.message.reply_text(f"✅ Pair {pair} dipilih. Tunggu sinyal setiap 10 menit!")
-    else:
-        await update.message.reply_text("⚠️ Pair tidak valid.")
-    return ConversationHandler.END
+# ===== STREAMLIT UI =====
+st.title("📡 Bot Sinyal Trading XAUUSD - Real-time Deriv")
+st.markdown("Indikator: **EMA50 + Bollinger Bands + Parabolic SAR**")
+st.markdown("---")
 
-async def send_signals(context: ContextTypes.DEFAULT_TYPE):
-    for chat_id, symbol in user_pairs.items():
-        signal = get_signal(symbol)
-        if signal:
-            await context.bot.send_message(chat_id=chat_id, text=signal)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=f"⏳ Tidak ada sinyal di {symbol} saat ini.")
-
-# Run bot
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={SELECTING_PAIR: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_pair)]},
-        fallbacks=[],
-    )
-    app.add_handler(conv_handler)
-
-    job_queue = app.job_queue
-    job_queue.run_repeating(send_signals, interval=600, first=10)  # setiap 10 menit
-
-    await app.run_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if st.button("🚀 Jalankan Bot Sekarang"):
+    t = threading.Thread(target=run_bot)
+    t.daemon = True
+    t.start()
+    st.success("✅ Bot aktif. Tunggu sinyal dikirim ke Telegram.")
+    st.info("Bot akan mengirim sinyal hanya jika minimal 2 dari 3 indikator cocok (Buy/Sell).")
